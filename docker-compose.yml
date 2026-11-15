@@ -1,0 +1,17 @@
+services:
+  fastq-receiver:
+    build: .
+    image: fastq-receiver:latest
+    container_name: fastq-receiver
+    ports:
+      - "8000:8000"
+    environment:
+      # 单批文件字节上限（压缩临时文件 + 展开 FASTQ 合计），默认 64 MiB
+      FASTQ_BATCH_BYTE_LIMIT: "67108864"
+      FASTQ_DATA_DIR: "/data"
+    volumes:
+      - fastq-data:/data
+    restart: unless-stopped
+
+volumes:
+  fastq-data:
