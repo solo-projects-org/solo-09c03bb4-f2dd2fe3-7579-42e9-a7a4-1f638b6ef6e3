@@ -9,6 +9,8 @@ services:
       # 单批文件字节上限（压缩临时文件 + 展开 FASTQ 合计），默认 64 MiB
       FASTQ_BATCH_BYTE_LIMIT: "67108864"
       FASTQ_DATA_DIR: "/data"
+      # 交接租期（秒）：领取后多久内可下载并回报摘要，默认 5 分钟
+      FASTQ_HANDOFF_LEASE_SECONDS: "300"
     volumes:
       - fastq-data:/data
     restart: unless-stopped

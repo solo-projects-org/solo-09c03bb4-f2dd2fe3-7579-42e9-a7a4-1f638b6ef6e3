@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     # 上传过程中多久检查一次取消信号，避免客户端迟迟不发数据
     upload_idle_timeout: float = Field(default=15.0, gt=0)
 
+    # 交接租期（秒）：领取后该时长内可下载并回报摘要，过期可被同批新领取取代
+    handoff_lease_seconds: int = Field(default=300, ge=1)
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "app.db"

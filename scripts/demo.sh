@@ -46,3 +46,22 @@ echo "下载正常批展开后的 R1（前 2 行）:"
 NORMAL_BID="$(curl -sS "$BASE/batches" | python3 -c \
   'import json,sys; print(next(b["id"] for b in json.load(sys.stdin)["batches"] if b["status"]=="ready"))')"
 curl -sS "$BASE/batches/$NORMAL_BID/files/R1/download" | head -n 2 || true
+
+echo
+echo "================ handoff ================"
+echo "领取交接（对两端原档计算 SHA-256）:"
+HANDOFF="$(curl -sS -X POST "$BASE/batches/$NORMAL_BID/handoffs")"
+echo "$HANDOFF" | python3 -m json.tool
+HID="$(echo "$HANDOFF" | python3 -c 'import json,sys; print(json.load(sys.stdin)["handoff_id"])')"
+
+echo "下载交接 R1 / R2 并按端回报摘要:"
+for role in R1 R2; do
+  out="$(mktemp)"
+  curl -sS -o "$out" "$BASE/handoffs/$HID/files/$role/download"
+  sha="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$out")"
+  echo "  $role $(wc -c < "$out") bytes sha256=$sha"
+  curl -sS -X POST "$BASE/handoffs/$HID/confirm/$role" \
+    -H 'Content-Type: application/json' -d "{\"sha256\":\"$sha\"}" | python3 -m json.tool
+  rm -f "$out"
+done
+curl -sS "$BASE/handoffs/$HID" | python3 -m json.tool

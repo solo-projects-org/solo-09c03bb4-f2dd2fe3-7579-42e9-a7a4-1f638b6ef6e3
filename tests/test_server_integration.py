@@ -200,7 +200,98 @@ def test_slow_upload_does_not_block_other_batch(server):
     t.join(timeout=30)
 
 
-def test_cancel_during_slow_upload_waits_and_cleans(server):
+def _sha256(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def test_handoff_claim_confirm_and_restart(server):
+    """真实单进程服务器：并发领取同一交接 → 两端摘要确认 → 重启后记录仍完成。"""
+    import threading
+
+    r1, r2 = _pair(6)
+    _, body = _req(server, "POST", "/batches", json.dumps({"sample_id": "itg-handoff"}).encode(),
+                   {"Content-Type": "application/json"})
+    bid = body["id"]
+    _req(server, "POST", f"/batches/{bid}/files/R1", _make_gz(r1),
+         {"Content-Type": "application/gzip"})
+    assert _req(server, "POST", f"/batches/{bid}/files/R2", _make_gz(r2),
+                {"Content-Type": "application/gzip"})[0] == 200
+
+    results = []
+
+    def claim():
+        results.append(_req(server, "POST", f"/batches/{bid}/handoffs"))
+
+    threads = [threading.Thread(target=claim) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(code == 201 for code, _ in results), results
+    ids = {body["handoff_id"] for _, body in results}
+    assert len(ids) == 1, ids
+    handoff = results[0][1]
+    hid = handoff["handoff_id"]
+
+    bdir = server["data_dir"] / "batches" / bid
+    assert handoff["r1"]["sha256"] == _sha256(bdir / "R1.fastq")
+    assert handoff["r2"]["sha256"] == _sha256(bdir / "R2.fastq")
+
+    # 交接下载入口真实取到原档
+    with urllib.request.urlopen(server["base"] + handoff["r1"]["download_path"]) as dl:
+        assert dl.read() == (bdir / "R1.fastq").read_bytes()
+
+    code, body = _req(server, "POST", f"/handoffs/{hid}/confirm/R1",
+                      json.dumps({"sha256": handoff["r1"]["sha256"]}).encode(),
+                      {"Content-Type": "application/json"})
+    assert code == 200 and body["completed"] is False and body["r1_confirmed"] is True
+    code, body = _req(server, "POST", f"/handoffs/{hid}/confirm/R2",
+                      json.dumps({"sha256": handoff["r2"]["sha256"]}).encode(),
+                      {"Content-Type": "application/json"})
+    assert code == 200 and body["completed"] is True and body["status"] == "completed"
+
+    # 重启服务器：completed 记录与 ready 批下载都保留
+    proc = server["proc"]
+    proc.terminate()
+    proc.wait(timeout=10)
+    env = {
+        **os.environ,
+        "FASTQ_DATA_DIR": str(server["data_dir"]),
+        "FASTQ_BATCH_BYTE_LIMIT": str(64 * 1024 * 1024),
+        "PYTHONPATH": str(REPO_ROOT),
+    }
+    port = int(server["base"].rsplit(":", 1)[1])
+    server["proc"] = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1",
+         "--port", str(port), "--log-level", "warning"],
+        cwd=REPO_ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(server["base"] + "/health", timeout=1) as r:
+                if r.status == 200:
+                    break
+        except OSError:
+            time.sleep(0.2)
+    else:
+        pytest.fail("server did not restart")
+
+    code, detail = _req(server, "GET", f"/handoffs/{hid}")
+    assert code == 200 and detail["status"] == "completed"
+    assert detail["r1"]["confirmed"] and detail["r2"]["confirmed"]
+    # 完成记录的存在不改变原 ready 状态与旧下载接口
+    assert _req(server, "GET", f"/batches/{bid}")[1]["status"] == "ready"
+    with urllib.request.urlopen(server["base"] + f"/batches/{bid}/files/R2/download") as dl:
+        assert dl.read() == (bdir / "R2.fastq").read_bytes()
+
     # 单成员、不可压缩的大 gzip：随机质量串让压缩后仍有足够体积，慢速传输确保取消时在途
     records = []
     for i in range(2000):

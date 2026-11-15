@@ -9,7 +9,8 @@ from pathlib import Path
 from fastapi import HTTPException
 
 from .database import get_conn, init_db
-from .models import BatchStatus, FileRole, utcnow_iso
+from .handoff import HandoffService
+from .models import BatchStatus, FileRole, HandoffStatus, utcnow_iso
 from .storage import (
     BatchRegistry,
     QuotaExceededError,
@@ -28,6 +29,7 @@ class BatchService:
         init_db(settings.db_path)
         self.space = SpaceManager(settings.batch_byte_limit)
         self.registry = BatchRegistry()
+        self.handoffs = HandoffService(settings, self)
         self._recovered = False
 
     # ------------------------------------------------------------------ #
@@ -98,6 +100,11 @@ class BatchService:
                 (BatchStatus.FAILED.value, reason[:2000], now, batch_id),
             )
             conn.execute("DELETE FROM files WHERE batch_id = ?", (batch_id,))
+            # 批次已不可交付，未完成的交接不得再被确认
+            conn.execute(
+                "UPDATE handoffs SET status = ?, updated_at = ? WHERE batch_id = ? AND status = ?",
+                (HandoffStatus.EXPIRED.value, now, batch_id, HandoffStatus.ACTIVE.value),
+            )
 
     async def _cleanup_files_only(self, batch_id: str) -> int:
         """删除本批全部文件并按磁盘真实占用回收配额，但不改批次状态。"""
@@ -254,6 +261,11 @@ class BatchService:
                 (BatchStatus.CANCELLED.value, "cancelled by operator", now, batch_id),
             )
             conn.execute("DELETE FROM files WHERE batch_id = ?", (batch_id,))
+            # 已交付完成的交接记录保留；未完成的交接随批次取消一律作废
+            conn.execute(
+                "UPDATE handoffs SET status = ?, updated_at = ? WHERE batch_id = ? AND status = ?",
+                (HandoffStatus.EXPIRED.value, now, batch_id, HandoffStatus.ACTIVE.value),
+            )
         await self.registry.remove(batch_id)
         return {
             "id": batch_id,
@@ -308,6 +320,9 @@ class BatchService:
             else:
                 await asyncio.to_thread(remove_batch_files, bdir)
                 await self.space.remove_batch(batch_id)
+
+        # 交接记录：completed 原样保留；active 沿用原到期时间（get/confirm 时按租期判定过期）
+        recovered["handoffs"] = self.handoffs.recover()
 
         # 磁盘上有目录但 DB 无记录的孤儿数据，直接回收
         for child in self.settings.batch_dir.iterdir():
